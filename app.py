@@ -2,6 +2,9 @@ import os
 import re
 from datetime import datetime
 from collections import defaultdict
+import html
+import threading
+import logging
 
 import numpy as np
 import pandas as pd
@@ -17,13 +20,11 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 app = Flask(__name__)
+logger = logging.getLogger(__name__)
 
-WATCH_FOLDER = os.environ.get(
-    "WATCH_FOLDER", 
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "DOCX")
-)
-print(f"🔍 DEBUG: WATCH_FOLDER = {WATCH_FOLDER}")  # ← AGGIUNGI QUESTA
-print(f"📁 Esiste? {os.path.exists(WATCH_FOLDER)}")
+WATCH_FOLDER = "DOCX"
+logger.debug("WATCH_FOLDER = %s", WATCH_FOLDER)
+logger.debug("WATCH_FOLDER exists? %s", os.path.exists(WATCH_FOLDER))
 
 class CorrelationMatrixGenerator:
     def __init__(self, watch_folder):
@@ -39,6 +40,7 @@ class CorrelationMatrixGenerator:
         self.tfidf_matrix = None
         self.correlation_matrix = None
         self.filename_to_index = {}
+        self.document_word_sets = {}      # filename -> set(words)
 
         self.csv_path = os.path.join(os.path.dirname(self.watch_folder), "output", "swallow_matrix.csv")
 
@@ -46,6 +48,7 @@ class CorrelationMatrixGenerator:
         self.connections = {}            # WORD -> list[(DOC_ID, chapter_title)]
         self.doc_id_to_filename = {}     # DOC_ID -> filename
         self.filename_to_doc_id = {}     # filename -> DOC_ID
+        self.filename_to_article_title = {}  # filename -> best article title
 
         # Chapter-level index (for "Analizza capitolo specifico")
         self.chapter_records = []        # list[dict] with DOC_ID, FILENAME, TITLE, LOCATION
@@ -57,18 +60,20 @@ class CorrelationMatrixGenerator:
     # -------------------------
     def load_all_files(self):
         if not os.path.exists(self.watch_folder):
-            print("❌ Cartella non trovata:", self.watch_folder)
+            logger.error("Cartella non trovata: %s", self.watch_folder)
             return False
 
         files = [f for f in os.listdir(self.watch_folder) if f.lower().endswith(".docx")]
         if not files:
-            print("⚠ Nessun file .docx trovato.")
+            logger.warning("Nessun file .docx trovato.")
             return False
 
         self.documents.clear()
         self.doc_chapters.clear()
         self.doc_id_to_filename.clear()
         self.filename_to_doc_id.clear()
+        self.filename_to_article_title.clear()
+        self.document_word_sets.clear()
 
         for file in files:
             path = os.path.join(self.watch_folder, file)
@@ -76,6 +81,9 @@ class CorrelationMatrixGenerator:
                 doc = docx.Document(path)
                 full_text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
                 self.documents[file] = full_text
+                self.document_word_sets[file] = set(
+                    re.findall(r"\b[a-zA-Z]{3,}\b", full_text.lower())
+                )
 
                 chapters = self.extract_chapters_from_headings(doc)
                 self.doc_chapters[file] = chapters
@@ -83,14 +91,15 @@ class CorrelationMatrixGenerator:
                 doc_id = os.path.splitext(file)[0].upper()
                 self.doc_id_to_filename[doc_id] = file
                 self.filename_to_doc_id[file] = doc_id
+                self.filename_to_article_title[file] = self.get_best_article_title(chapters, file)
 
-                print(f"✅ {file}: {len(chapters)} capitoli trovati")
+                logger.info("%s: %s capitoli trovati", file, len(chapters))
             except Exception as e:
-                print(f"❌ Errore {file}: {e}")
+                logger.exception("Errore durante il parsing di %s: %s", file, e)
 
         self.build_chapter_index()
 
-        print(f"📄 Caricati {len(files)} file.")
+        logger.info("Caricati %s file DOCX.", len(files))
         return True
 
     def extract_chapters_from_headings(self, doc):
@@ -139,6 +148,44 @@ class CorrelationMatrixGenerator:
             chapters.append((current_title, " ".join(current_content).strip()))
 
         return chapters
+
+    def get_best_article_title(self, chapters, fallback_filename):
+        """
+        Seleziona un titolo articolo leggibile dal DOCX.
+        Preferisce il primo heading utile (non indice/resources), altrimenti usa il nome file.
+        """
+        ignore_titles = self._ignore_titles_set()
+        fallback_country = os.path.splitext(fallback_filename)[0].replace("_", " ").strip().upper()
+        candidates = []
+
+        for title, content in chapters:
+            title_clean = title.strip()
+            title_upper = title_clean.upper()
+            if not title_clean:
+                continue
+            if title_upper in ignore_titles:
+                continue
+            low = title_upper.lower()
+            if "resources" in low or "sources" in low:
+                continue
+            if len(title_clean) < 3:
+                continue
+
+            # Scarta intestazioni "copertina" come "EGYPT" / "THE NETHERLANDS".
+            normalized_title = re.sub(r"\s+", " ", title_upper)
+            if normalized_title == fallback_country:
+                continue
+
+            content_len = len((content or "").strip())
+            word_count = len(re.findall(r"\b\w+\b", title_clean))
+            has_colon = ":" in title_clean
+            candidates.append((has_colon, content_len > 0, word_count, len(title_clean), title_clean))
+
+        if candidates:
+            candidates.sort(reverse=True)
+            return candidates[0][-1]
+
+        return os.path.splitext(fallback_filename)[0].replace("_", " ").title()
 
     def _ignore_titles_set(self):
         return {
@@ -272,67 +319,74 @@ class CorrelationMatrixGenerator:
             for word, locs in sorted_items
         }
 
-        print(f"🔑 {len(self.connections)} parole indicizzate (globale).")
+        logger.info("%s parole indicizzate (globale).", len(self.connections))
         return self.connections
 
     # -------------------------
     # Multi-word semantic query (document-level)
     # -------------------------
-    def search_query_connections(self, query, min_sim=0.10, top_n=5):
+    def search_query_connections(self, query, min_semantic=0.08, top_n=12):
         """
-        Cerca capitoli che contengono tutte le parole (split classico), poi ranking doc-level.
+        Ranking ibrido per "stessa idea" + "stesse parole":
+        - Similarita semantica TF-IDF tra query e documento.
+        - Overlap lessicale (parole query presenti nel documento).
+        - Bonus se la frase query compare letteralmente.
         """
-        if not query or self.tfidf_matrix is None or self.correlation_matrix is None:
+        if not query or self.tfidf_matrix is None or self.vectorizer is None:
             return []
 
         terms = re.findall(r'\b[a-zA-Z]{3,}\b', query.lower())
-        if not terms:
+        normalized_query = query.strip().lower()
+        if not terms and not normalized_query:
             return []
 
-        ignore_titles = self._ignore_titles_set()
+        query_vec = self.vectorizer.transform([query])
+        semantic_scores = cosine_similarity(query_vec, self.tfidf_matrix).flatten()
+
+        phrase_chunks = [p.strip().lower() for p in re.split(r"[;\n]+", query) if p.strip()]
+        if normalized_query and normalized_query not in phrase_chunks:
+            phrase_chunks.append(normalized_query)
+
+        query_terms_set = set(terms)
         results = []
 
-        for filename, chapters in self.doc_chapters.items():
-            doc_id = os.path.splitext(filename)[0].upper()
+        for filename in self.chapter_keys:
+            idx = self.filename_to_index.get(filename)
+            if idx is None:
+                continue
 
-            for title, content in chapters:
-                title_clean = title.upper().strip()
-                if title_clean in ignore_titles:
-                    continue
-                if "resources" in title_clean.lower() or "sources" in title_clean.lower():
-                    continue
+            semantic_score = float(semantic_scores[idx])
+            doc_terms = self.document_word_sets.get(filename, set())
+            shared_terms = sorted(query_terms_set.intersection(doc_terms))
+            lexical_score = (len(shared_terms) / len(query_terms_set)) if query_terms_set else 0.0
 
-                lowered = (content or "").lower()
-                if not all(t in lowered for t in terms):
-                    continue
+            full_text_lower = self.documents.get(filename, "").lower()
+            phrase_hits = [p for p in phrase_chunks if p and p in full_text_lower]
+            phrase_bonus = 0.10 if phrase_hits else 0.0
 
-                idx = self.filename_to_index.get(filename)
-                if idx is None:
-                    continue
+            final_score = (0.75 * semantic_score) + (0.25 * lexical_score) + phrase_bonus
 
-                row = self.correlation_matrix[idx]
-                sim_indices = sorted(range(len(row)), key=lambda i: row[i], reverse=True)
+            if semantic_score < min_semantic and not shared_terms and not phrase_hits:
+                continue
 
-                top_related = []
-                for i in sim_indices:
-                    if i == idx:
-                        continue
-                    sim = float(row[i])
-                    if sim < min_sim:
-                        continue
-                    top_related.append({"DOCUMENTO": self.chapter_keys[i], "SIMILARITÀ": sim})
-                    if len(top_related) >= top_n:
-                        break
+            results.append({
+                "DOCUMENTO": filename,
+                "DOC_ID": self.filename_to_doc_id.get(filename, os.path.splitext(filename)[0].upper()),
+                "ARTICOLO": self.filename_to_article_title.get(filename, os.path.splitext(filename)[0].replace("_", " ").title()),
+                "LABEL": (
+                    f"{self.filename_to_doc_id.get(filename, os.path.splitext(filename)[0].upper())}: "
+                    f"{self.filename_to_article_title.get(filename, os.path.splitext(filename)[0].replace('_', ' ').title())}"
+                ),
+                "PUNTEGGIO": final_score,
+                "SIMILARITA_SEMANTICA": semantic_score,
+                "OVERLAP_LESSICALE": lexical_score,
+                "PAROLE_IN_COMUNE": shared_terms[:12],
+                "N_PAROLE_IN_COMUNE": len(shared_terms),
+                "FRASI_TROVATE": phrase_hits[:5]
+            })
 
-                results.append({
-                    "QUERY": query,
-                    "PAROLE_QUERY": ", ".join(terms),
-                    "PAESE_CAPITOLO": f"{doc_id}: {title}",
-                    "DOCUMENTO_BASE": filename,
-                    "CORRELAZIONI": top_related
-                })
-
-        return results
+        results.sort(key=lambda r: (r["PUNTEGGIO"], r["SIMILARITA_SEMANTICA"], r["N_PAROLE_IN_COMUNE"]), reverse=True)
+        return results[:top_n]
 
     # -------------------------
     # Chapter-specific phrase logic (NO splitting compositions)
@@ -423,20 +477,45 @@ class CorrelationMatrixGenerator:
 
 
 class DocxChangeHandler(FileSystemEventHandler):
-    def __init__(self, generator):
+    def __init__(self, generator, lock, min_interval=2.0):
         self.generator = generator
+        self.lock = lock
+        self.min_interval = float(min_interval)
+        self.last_refresh_ts = 0.0
 
     def on_any_event(self, event):
-        if event.src_path.lower().endswith(".docx"):
-            print("📄 Modifica rilevata. Aggiorno...")
+        if getattr(event, "is_directory", False):
+            return
+
+        # Watch only relevant filesystem changes and ignore noisy events.
+        if event.event_type not in {"created", "modified", "moved", "deleted"}:
+            return
+
+        src_path = getattr(event, "src_path", "") or ""
+        dest_path = getattr(event, "dest_path", "") or ""
+        touches_docx = src_path.lower().endswith(".docx") or dest_path.lower().endswith(".docx")
+        if not touches_docx:
+            return
+
+        now = time.time()
+        if now - self.last_refresh_ts < self.min_interval:
+            return
+
+        with self.lock:
+            # Double-check after lock in case another thread already refreshed.
+            now = time.time()
+            if now - self.last_refresh_ts < self.min_interval:
+                return
+            logger.info("Modifica DOCX rilevata. Aggiorno...")
             if self.generator.load_all_files():
                 self.generator.generate_csv_matrix()
                 self.generator.generate_word_connections()
-                print("✅ Aggiornato!")
+                self.last_refresh_ts = now
+                logger.info("Aggiornato.")
 
 
-def start_watcher(generator):
-    event_handler = DocxChangeHandler(generator)
+def start_watcher(generator, lock):
+    event_handler = DocxChangeHandler(generator, lock=lock, min_interval=2.0)
     observer = Observer()
     observer.schedule(event_handler, generator.watch_folder, recursive=False)
     observer.start()
@@ -448,28 +527,42 @@ gen = CorrelationMatrixGenerator(WATCH_FOLDER)
 global_df = None
 global_connections = {}
 last_update = 0
+cache_lock = threading.RLock()
+
+def refresh_cache_if_needed(force=False):
+    global global_df, global_connections, last_update
+    if force or (time.time() - last_update > 300) or (global_df is None):
+        logger.info("Ricaricamento dati...")
+        gen.load_all_files()
+        global_df, _ = gen.generate_csv_matrix()
+        global_connections = gen.generate_word_connections()
+        last_update = time.time()
+        logger.info("Dati aggiornati.")
 
 
 
 @app.route("/", methods=["GET", "POST"])
 def home():
-    global global_df, global_connections, last_update
-    
-    # Ricarica solo se >5min dall'ultima o primo avvio
-    if time.time() - last_update > 300 or global_df is None:
-        print("🔄 Ricaricamento dati...")
-        gen.load_all_files()
-        global_df, _ = gen.generate_csv_matrix()
-        global_connections = gen.generate_word_connections()
-        last_update = time.time()
-        print("✅ Dati aggiornati")
-    
-    df = global_df
-    gen.connections = global_connections  # per UI
     user_query = request.form.get("query", "").strip()
     chapter_query = request.form.get("chapter_query", "").strip()
     phrase_query = request.form.get("phrase_query", "").strip()
 
+    with cache_lock:
+        refresh_cache_if_needed(force=False)
+
+        df = global_df
+        current_connections = global_connections
+        query_results = gen.search_query_connections(user_query) if user_query else []
+        reports = (
+            gen.analyze_chapter_specific_phrase_logic(
+                chapter_query=chapter_query,
+                phrase_query=phrase_query,
+                top_n_links=12,
+                min_score=0.06,
+                alpha_phrase=0.70
+            )
+            if chapter_query else None
+        )
 
     if df is None:
         return "<h1>Nessun file DOCX trovato.</h1>"
@@ -478,7 +571,7 @@ def home():
     # Global index table
     # -------------------------
     global_rows = []
-    for word, places in gen.connections.items():
+    for word, places in current_connections.items():
         for doc_id, chap_title in places:
             global_rows.append({
                 "PAROLA_CHIAVE": word,
@@ -495,7 +588,7 @@ def home():
         connections_html = connections_df.to_html(
             index=False,
             table_id="connectionsTable",
-            escape=False,
+            escape=True,
             classes="crossref-table"
         )
     else:
@@ -508,36 +601,51 @@ def home():
     matrix_html = df.to_html(
         table_id="matrixTable",
         classes="matrix-table",
-        escape=False,
+        escape=True,
         float_format=lambda x: f"{x:.3f}"
     )
 
     # -------------------------
     # Semantic query section
     # -------------------------
-    query_results = gen.search_query_connections(user_query) if user_query else []
     if query_results:
-        blocks = []
+        rows = []
         for res in query_results:
-            corr_rows = "".join(
-                f"<tr><td>{c['DOCUMENTO']}</td><td>{c['SIMILARITÀ']:.3f}</td></tr>"
-                for c in res["CORRELAZIONI"]
+            shared = ", ".join(res["PAROLE_IN_COMUNE"]) if res["PAROLE_IN_COMUNE"] else "—"
+            phrases = ", ".join(res["FRASI_TROVATE"]) if res["FRASI_TROVATE"] else "—"
+            rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(res['LABEL']))}</td>"
+                f"<td>{res['PUNTEGGIO']:.3f}</td>"
+                f"<td>{res['SIMILARITA_SEMANTICA']:.3f}</td>"
+                f"<td>{res['OVERLAP_LESSICALE']:.3f}</td>"
+                f"<td>{res['N_PAROLE_IN_COMUNE']}</td>"
+                f"<td>{html.escape(shared)}</td>"
+                f"<td>{html.escape(phrases)}</td>"
+                "</tr>"
             )
-            blocks.append(f"""
-                <div class="query-block">
-                    <h3>📍 Capitolo: <em>{res['PAESE_CAPITOLO']}</em></h3>
-                    <p><strong>Parole query:</strong> {res['PAROLE_QUERY']}</p>
-                    <table class="query-table">
-                        <thead><tr><th>Articolo correlato</th><th>Similarità TF‑IDF</th></tr></thead>
-                        <tbody>{corr_rows}</tbody>
-                    </table>
-                </div>
-            """)
-        query_html = "".join(blocks)
+
+        query_html = (
+            "<div class='query-block'>"
+            "<p><strong>Risultati:</strong> articoli ordinati per idea simile (semantica) e parole in comune.</p>"
+            "<table class='query-table'>"
+            "<thead><tr>"
+            "<th>Articolo (Paese: Titolo)</th>"
+            "<th>Punteggio</th>"
+            "<th>Semantica</th>"
+            "<th>Overlap parole</th>"
+            "<th># Parole comuni</th>"
+            "<th>Parole comuni</th>"
+            "<th>Frasi trovate</th>"
+            "</tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
+            "</div>"
+        )
     elif user_query:
-        query_html = "<p>❌ Nessun capitolo trovato che contenga tutte le parole della query.</p>"
+        query_html = "<p>❌ Nessun articolo semanticamente simile o con parole in comune trovato.</p>"
     else:
-        query_html = "<p>🔍 Inserisci 2+ parole per vedere correlazioni tra articoli.</p>"
+        query_html = "<p>🔍 Inserisci una parola o una frase per trovare articoli con la stessa idea e parole condivise.</p>"
 
     # -------------------------
     # Chapter-specific phrase output (always in your format)
@@ -545,14 +653,6 @@ def home():
     if not chapter_query:
         chapter_html = "<p>📚 Inserisci un capitolo. (Opzionale) Inserisci 1+ frasi/composti separati da ';' oppure a capo.</p>"
     else:
-        reports = gen.analyze_chapter_specific_phrase_logic(
-            chapter_query=chapter_query,
-            phrase_query=phrase_query,
-            top_n_links=12,
-            min_score=0.06,
-            alpha_phrase=0.70
-        )
-
         if not reports:
             chapter_html = "<p>❌ Capitolo non trovato.</p>"
         else:
@@ -564,11 +664,12 @@ def home():
                 # | other_location,
                 # | ...
                 out_lines = []
-                first_loc = lines[0]["LOCATION"]
-                out_lines.append(f"{rep['LABEL']} | {first_loc},")
+                first_loc = html.escape(str(lines[0]["LOCATION"]))
+                label = html.escape(str(rep["LABEL"]))
+                out_lines.append(f"{label} | {first_loc},")
 
                 for idx, item in enumerate(lines[1:], start=1):
-                    loc = item["LOCATION"]
+                    loc = html.escape(str(item["LOCATION"]))
                     comma = "," if idx < len(lines) - 1 else ""
                     out_lines.append(f"| {loc}{comma}")
 
@@ -783,22 +884,22 @@ def home():
     </script>
 </head>
 
-<body>
+    <body>
     <h1>🧠 Swallow Cross-Reference Intelligence</h1>
 
     <div class="stats">
         <strong>📊 LIVE:</strong> {len(df)} documenti |
-        {len(gen.connections)} parole indicizzate |
+        {len(current_connections)} parole indicizzate |
         {len(global_rows)} occorrenze |
         <em>Aggiornato: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</em>
     </div>
 
     <div class="query-section">
         <form method="POST">
-            <label for="query"><strong>🔍 Cerca correlazioni tra articoli (Multi-parola)</strong><br>
-            <small>Qui la query viene spezzata in parole (modalità “classica”).</small></label>
-            <input type="text" id="query" name="query" value="{user_query}" placeholder="Es: volcano microclimate tourism">
-            <button type="submit">Analizza query semantica</button>
+            <label for="query"><strong>🔍 Cerca articoli con la stessa idea (e parole in comune)</strong><br>
+            <small>Scrivi una parola o una frase: il ranking combina similarità semantica + overlap lessicale.</small></label>
+            <input type="text" id="query" name="query" value="{html.escape(user_query, quote=True)}" placeholder="Es: climate change impact on tourism">
+            <button type="submit">Trova articoli simili</button>
         </form>
         <div style="margin-top:15px;">{query_html}</div>
     </div>
@@ -809,11 +910,11 @@ def home():
             <small>Il filtro sotto è una o più frasi/composti: separa con “;” oppure a capo.</small></label>
 
             <input type="text" id="chapter_query" name="chapter_query"
-                   value="{chapter_query}"
+                   value="{html.escape(chapter_query, quote=True)}"
                    placeholder="Capitolo (es: Stromboli / Diwali / Mount Fuji)">
 
             <input type="text" id="phrase_query" name="phrase_query"
-                   value="{phrase_query}"
+                   value="{html.escape(phrase_query, quote=True)}"
                    placeholder="Frase/composto (es: mount fuji; plate tectonics; volcanic landscape)">
 
             <button type="submit" style="background:#059669;">📌 Mostra output</button>
@@ -851,4 +952,16 @@ def download_csv():
 if __name__ == "__main__":
     debug = os.environ.get("FLASK_DEBUG") == "1"
     port = int(os.environ.get("CONTAINER_PORT", "5000"))
-    app.run(debug=debug, host="0.0.0.0", port=port, use_reloader=False)
+    log_level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s"
+    )
+    enable_watcher = os.environ.get("ENABLE_DOCX_WATCHER", "1") == "1"
+    observer = start_watcher(gen, cache_lock) if enable_watcher else None
+    try:
+        app.run(debug=debug, host="0.0.0.0", port=port, use_reloader=False)
+    finally:
+        if observer is not None:
+            observer.stop()
+            observer.join(timeout=5)
